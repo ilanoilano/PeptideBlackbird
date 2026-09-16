@@ -1,0 +1,24 @@
+# 核心科学计算
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+
+# 生物信息/结构生物学
+biopython>=1.81
+rdkit>=2023.09.0
+openbabel>=3.1.0
+openmm>=8.0.0
+pdbfixer>=1.9.0
+
+# 深度学习
+torch>=2.0.0
+fair-esm>=2.0.0
+
+# 对接工具
+vina>=1.2.0
+fpocket>=4.0.0
+
+# 工具
+pyyaml>=6.0
+tqdm>=4.65.0

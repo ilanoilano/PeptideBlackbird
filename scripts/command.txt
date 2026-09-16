@@ -1,0 +1,61 @@
+# 删除旧的训练数据
+rm -f /mnt/d/code/AA/sequences.txt
+rm -f /mnt/d/code/AA/results/1LYZ/energies.csv
+rm -rf /mnt/d/code/AA/egnn/raw/*.npz
+rm -rf /mnt/d/code/AA/egnn/models/*.pt
+
+# 运行冷启动
+python run_phase2.py -t 1LYZ --cold-start --n-sequences 150
+
+# 查看进程状态（不进入 top）
+ps aux | grep python
+
+# 查看进程打开的文件
+lsof -p 4775 2>/dev/null | head -20
+
+
+#以下是彻底删除
+# 1. 进入项目目录
+cd /mnt/d/code/AA
+
+# 2. 停止正在运行的进程（如果有）
+pkill -f "python run_phase2.py"
+
+# 3. 删除检查点文件（MCTS树状态）
+rm -rf checkpoints/1LYZ/
+
+# 4. 删除恢复状态文件
+rm -f checkpoints/1LYZ/resume_state.json
+
+# 5. 删除EGNN模型（可选，如果要重新冷启动）
+rm -f egnn/models/best_model.pt
+rm -f egnn/models/best_model.pt.backup
+rm -f egnn/models/training_history.json
+
+# 6. 删除数据集（可选）
+rm -f results/1LYZ/dataset.csv
+rm -f results/1LYZ/candidates.csv
+rm -f results/1LYZ/energies.csv
+
+# 7. 删除日志（可选）
+rm -f logs/1LYZ_*.log
+
+# 8. 删除EGNN训练数据（可选）
+rm -f egnn/raw/*.npz
+rm -f sequences.txt
+
+# 9. 删除临时文件
+rm -rf temp/mcts_simulation/*
+
+# 10. 确认删除完成
+echo "删除完成，剩余文件："
+ls -la checkpoints/ 2>/dev/null || echo "  checkpoints: 已清空"
+ls -la egnn/models/ 2>/dev/null || echo "  egnn/models: 已清空"
+
+
+###运行
+
+python3 run_phase2.py -t 1LYZ --cold-start --n-sequences 200 --n-rounds 20 --top-n-final 20
+
+
+

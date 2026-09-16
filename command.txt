@@ -1,0 +1,29 @@
+
+
+
+# 从 energies.csv 提取序列，覆盖 sequences.txt
+python -c "
+import csv
+
+sequences = []
+with open('results/6Y9A/energies.csv', 'r') as f:
+    reader = csv.reader(f)
+    next(reader, None)  # 跳过表头
+    for row in reader:
+        if row:
+            seq = row[0].strip()
+            if seq:
+                sequences.append(seq)
+
+with open('sequences.txt', 'w') as f:
+    for seq in sequences:
+        f.write(f'{seq}\n')
+
+print(f'已写入 {len(sequences)} 个序列到 sequences.txt')
+"
+
+
+python run_phase2_v4.py -t 6Y9A --max-iterations 50000 --validation-interval 1000 --cold-start-n 5000
+python EGNN_1.py -s sequences.txt -e results/6Y9A/energies.csv --target 6Y9A
+python EGNN_23.py --target 6Y9A --hidden-dim 64 --num-layers 3
+python EGNN_4.py --hidden-dim 64 --num-layers 3
