@@ -44,7 +44,104 @@ PDB_DIR = BASE_DIR / "PDB"
 RESULTS_DIR = BASE_DIR / "results"
 FINAL_DIR = BASE_DIR / "final"
 MODELS_DIR = BASE_DIR / "models"
+# =============================================================================
+# 序列解析/格式化函数（支持非天然氨基酸）
+# =============================================================================
+# 命名规则：
+# - 单个大写字母 = 天然氨基酸（如 'A', 'C', 'D'）
+# - 大写字母 + 后续小写字母 = 非天然氨基酸（如 'Aib', 'Nle'）
+# - 占位符：'_', 'x', 'X'（仅在模板或未完成序列中出现）
+# =============================================================================
 
+# 占位符集合
+_PLACEHOLDERS = {'_', 'x', 'X'}
+
+
+def parse_sequence(sequence) -> list:
+    """
+    解析氨基酸序列为氨基酸名称列表
+
+    规则：
+    - 单个大写字母 = 天然氨基酸
+    - 大写字母 + 后续小写字母 = 非天然氨基酸（后续小写不能含 'x'/'X'）
+    - 占位符 '_' / 'x' / 'X' 单独作为一个元素
+
+    Args:
+        sequence: 字符串（如 "ACAibCG"）或列表（如 ["A", "C", "Aib"]）
+
+    Returns:
+        氨基酸名称列表，如 ["A", "C", "Aib", "C", "G"]
+    """
+    if isinstance(sequence, list):
+        return list(sequence)
+    if not isinstance(sequence, str):
+        raise TypeError(f"parse_sequence 需要 str 或 list，得到 {type(sequence)}")
+    if not sequence:
+        return []
+
+    result = []
+    i = 0
+    n = len(sequence)
+
+    while i < n:
+        ch = sequence[i]
+
+        # 占位符：单独作为一个元素
+        if ch in _PLACEHOLDERS:
+            result.append(ch)
+            i += 1
+            continue
+
+        if not ch.isalpha():
+            raise ValueError(f"非法字符 '{ch}' 在位置 {i}")
+
+        if ch.isupper():
+            # 【关键】后续小写字母不能包含占位符
+            if (i + 1 < n
+                    and sequence[i + 1].islower()
+                    and sequence[i + 1] not in _PLACEHOLDERS):
+                j = i + 1
+                while (j < n
+                       and sequence[j].islower()
+                       and sequence[j] not in _PLACEHOLDERS):
+                    j += 1
+                result.append(sequence[i:j])
+                i = j
+            else:
+                # 单个大写字母 = 天然氨基酸
+                result.append(ch)
+                i += 1
+        else:
+            # 小写字母开头（非占位符）：非法
+            raise ValueError(
+                f"序列不能以小写字母开头（位置 {i}: '{ch}'）。"
+                f"非天然氨基酸必须首字母大写。"
+            )
+
+    return result
+
+def format_sequence(amino_acids) -> str:
+    """
+    把氨基酸名称列表拼回字符串
+
+    Args:
+        amino_acids: 列表，如 ["A", "C", "Aib", "C", "G"]；或字符串
+
+    Returns:
+        字符串，如 "ACAibCG"
+    """
+    if isinstance(amino_acids, str):
+        return amino_acids
+    return ''.join(amino_acids)
+
+
+def sequence_length(sequence) -> int:
+    """
+    计算序列的氨基酸数量（不是字符数）
+
+    对 "ACAibCG" 返回 5，而不是 7。
+    """
+    return len(parse_sequence(sequence))
 
 # =============================================================================
 # EGNN 靶点相关路径
@@ -145,12 +242,80 @@ FIXED_POSITIONS = {
 }
 
 # 可变位置（模板中 'x' 的位置）
-def get_variable_positions(template: str = PEPTIDE_TEMPLATE) -> list:
-    """从模板中提取可变位置索引"""
-    return [i for i, aa in enumerate(template) if aa == 'x']
+def get_variable_positions(template=None) -> list:
+    """从模板中提取可变位置索引（氨基酸索引，不是字符索引）"""
+    if template is None:
+        template = PEPTIDE_TEMPLATE
+    amino_acids = parse_sequence(template)
+    return [i for i, aa in enumerate(amino_acids) if aa in ('x', 'X')]
 
 VARIABLE_POSITIONS = get_variable_positions()
 
+
+
+# =============================================================================
+# 氨基酸属性配置（天然 + 非天然）
+# =============================================================================
+# 【顺序很重要】
+# 1. 天然氨基酸属性（HYDROPATHY_NATURAL / AA_CHARGE_NATURAL / AA_MOLECULAR_WEIGHT_NATURAL）
+# 2. 天然氨基酸列表（ALLOWED_AMINO_ACIDS_NATURAL）
+# 3. 非天然氨基酸占位（空字典，运行时由 amino_acid_loader 填充）
+# 4. 合并后的字典（HYDROPATHY / AA_CHARGE / AA_MOLECULAR_WEIGHT）
+# 5. 合并后的氨基酸列表（ALLOWED_AMINO_ACIDS）
+# 6. 每个可变位置的可选氨基酸（VARIABLE_AA_OPTIONS / VARIABLE_AMINO_ACIDS）
+
+# --- 1. 天然氨基酸属性 ---
+HYDROPATHY_NATURAL = {
+    "A": 1.8, "C": 2.5, "D": -3.5, "E": -3.5,
+    "F": 2.8, "G": -0.4, "H": -3.2, "I": 4.5,
+    "K": -3.9, "L": 3.8, "M": 1.9, "N": -3.5,
+    "P": -1.6, "Q": -3.5, "R": -4.5, "S": -0.8,
+    "T": -0.7, "V": 4.2, "W": -0.9, "Y": -1.3,
+}
+
+AA_CHARGE_NATURAL = {
+    "D": -1, "E": -1, "R": +1, "K": +1,
+    "H": 0.5,
+}
+
+AA_MOLECULAR_WEIGHT_NATURAL = {
+    "A": 89.09, "C": 121.16, "D": 133.10, "E": 147.13,
+    "F": 165.19, "G": 75.07, "H": 155.16, "I": 131.17,
+    "K": 146.19, "L": 131.17, "M": 149.21, "N": 132.12,
+    "P": 115.13, "Q": 146.15, "R": 174.20, "S": 105.09,
+    "T": 119.12, "V": 117.15, "W": 204.23, "Y": 181.19,
+}
+
+# --- 2. 天然氨基酸列表 ---
+ALLOWED_AMINO_ACIDS_NATURAL = [
+    "A", "D", "E", "F", "G", "H", "I", "K", "L",
+    "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y"
+]
+
+# --- 3. 非天然氨基酸占位（运行时由 amino_acid_loader 填充）---
+HYDROPATHY_NONNATURAL = {}
+AA_CHARGE_NONNATURAL = {}
+AA_MOLECULAR_WEIGHT_NONNATURAL = {}
+NONNATURAL_AA_SMILES = {}
+
+# --- 4. 合并后的字典 ---
+HYDROPATHY = {**HYDROPATHY_NATURAL, **HYDROPATHY_NONNATURAL}
+AA_CHARGE = {**AA_CHARGE_NATURAL, **AA_CHARGE_NONNATURAL}
+AA_MOLECULAR_WEIGHT = {**AA_MOLECULAR_WEIGHT_NATURAL, **AA_MOLECULAR_WEIGHT_NONNATURAL}
+
+# --- 5. 合并后的氨基酸列表 ---
+ALLOWED_AMINO_ACIDS = ALLOWED_AMINO_ACIDS_NATURAL.copy()
+
+# --- 6. 每个可变位置的可选氨基酸 ---
+VARIABLE_AA_OPTIONS = {
+    pos: ALLOWED_AMINO_ACIDS.copy() for pos in VARIABLE_POSITIONS
+}
+
+VARIABLE_AMINO_ACIDS = {
+    pos: ALLOWED_AMINO_ACIDS.copy() for pos in VARIABLE_POSITIONS
+}
+
+# =============================================================================
 # 标准20种氨基酸
 AMINO_ACIDS = {
     "A", "D", "E", "F", "G", "H", "I", "K", "L",
@@ -159,39 +324,9 @@ AMINO_ACIDS = {
 
 # 可变位置允许的氨基酸集合
 # 标准20种氨基酸（包含C，用于TBMB交联剂的第三个Cys）
-ALLOWED_AMINO_ACIDS = [
-    "A",  # Ala 丙氨酸
-
-    "D",  # Asp 天冬氨酸
-    "E",  # Glu 谷氨酸
-    "F",  # Phe 苯丙氨酸
-    "G",  # Gly 甘氨酸
-    "H",  # His 组氨酸
-    "I",  # Ile 异亮氨酸
-    "K",  # Lys 赖氨酸
-    "L",  # Leu 亮氨酸
-    "M",  # Met 甲硫氨酸
-    "N",  # Asn 天冬酰胺
-    "P",  # Pro 脯氨酸
-    "Q",  # Gln 谷氨酰胺
-    "R",  # Arg 精氨酸
-    "S",  # Ser 丝氨酸
-    "T",  # Thr 苏氨酸
-    "V",  # Val 缬氨酸
-    "W",  # Trp 色氨酸
-    "Y",  # Tyr 酪氨酸
-]
 
 # 每个可变位置的可选氨基酸（默认全部，可针对特定位置限制）
-VARIABLE_AA_OPTIONS = {
-    pos: ALLOWED_AMINO_ACIDS.copy() for pos in VARIABLE_POSITIONS
-}
-
 # 可变位置氨基酸映射（用于MCTS扩展）
-VARIABLE_AMINO_ACIDS = {
-    pos: ALLOWED_AMINO_ACIDS.copy() for pos in VARIABLE_POSITIONS
-}
-
 # =============================================================================
 # 环化配置
 # =============================================================================
@@ -217,11 +352,11 @@ MOLECULAR_WEIGHT_RANGE = (800, 2000)
 
 
 # 计算可变位置数（模板中'x'的数量）
-def _count_variable_positions(template: str = None) -> int:
-    """计算模板中可变位置的数量"""
+def _count_variable_positions(template=None) -> int:
     if template is None:
         template = PEPTIDE_TEMPLATE
-    return sum(1 for c in template if c in ['x', 'X'])
+    amino_acids = parse_sequence(template)
+    return sum(1 for aa in amino_acids if aa in ('x', 'X'))
 
 VARIABLE_POSITIONS_COUNT = _count_variable_positions()
 
@@ -256,6 +391,17 @@ COLD_START_CONFIG = {
 ACTIVE_LEARNING_CONFIG = {
     "min_new_data": 2000,       # 触发重新训练的最小新增数据量
     "min_new_ratio": 0.2,       # 触发重新训练的最小新增比例
+}
+
+# =============================================================================
+# EGNN 微调数据集构建配置
+# =============================================================================
+# 每次微调 EGNN 时，从"全部历史 GNINA 验证数据"中挑选固定数量的样本
+# 挑选策略：80% 最优（按 energy 升序）+ 20% 随机（从中低能量中采样）
+FINETUNE_CONFIG = {
+    "target_size": 100,       # 目标数据集大小 a
+    "best_ratio": 0.8,        # 最优样本比例
+    "random_seed": 42,        # 随机种子
 }
 
 # =============================================================================
@@ -332,28 +478,18 @@ MULTI_ROUND_CONFIG = {
 # =============================================================================
 
 # Kyte-Doolittle 疏水性标度（正值疏水，负值亲水）
-HYDROPATHY = {
-    "A": 1.8,   "C": 2.5,   "D": -3.5,  "E": -3.5,
-    "F": 2.8,   "G": -0.4,  "H": -3.2,  "I": 4.5,
-    "K": -3.9,  "L": 3.8,   "M": 1.9,   "N": -3.5,
-    "P": -1.6,  "Q": -3.5,  "R": -4.5,  "S": -0.8,
-    "T": -0.7,  "V": 4.2,   "W": -0.9,  "Y": -1.3,
-}
 
+# =============================================================================
+# 非天然氨基酸配置（从 amino/AMINO.txt 动态加载）
+# =============================================================================
+
+# 天然氨基酸的默认值（保持不变）
+# 非天然氨基酸（运行时从 amino/ 加载）
+# 合并后的字典（运行时由 amino_acid_loader 填充）
+# 天然氨基酸列表（保持不变）
 # 氨基酸电荷（pH 7.4 近似）
-AA_CHARGE = {
-    "D": -1,    "E": -1,    "R": +1,    "K": +1,
-    "H": 0.5,   # 组氨酸部分带电
-}
 
 # 氨基酸分子量（Da）
-AA_MOLECULAR_WEIGHT = {
-    "A": 89.09,   "C": 121.16,  "D": 133.10,  "E": 147.13,
-    "F": 165.19,  "G": 75.07,   "H": 155.16,  "I": 131.17,
-    "K": 146.19,  "L": 131.17,  "M": 149.21,  "N": 132.12,
-    "P": 115.13,  "Q": 146.15,  "R": 174.20,  "S": 105.09,
-    "T": 119.12,  "V": 117.15,  "W": 204.23,  "Y": 181.19,
-}
 
 # =============================================================================
 # 蛋白酶切割位点预测配置
@@ -375,17 +511,15 @@ PROTEASE_CONFIG = {
 # 辅助函数
 # =============================================================================
 
-def calculate_peptide_weight(sequence: str) -> float:
-    """计算肽链分子量（减去水分子）"""
-    weight = sum(AA_MOLECULAR_WEIGHT.get(aa, 0) for aa in sequence)
-    # 减去 (n-1) 个水分子（肽键形成失去的水）
-    weight -= 18.015 * (len(sequence) - 1)
+def calculate_peptide_weight(sequence) -> float:
+    amino_acids = parse_sequence(sequence)
+    weight = sum(AA_MOLECULAR_WEIGHT.get(aa, 0) for aa in amino_acids)
+    weight -= 18.015 * (len(amino_acids) - 1)
     return weight
 
-def get_net_charge(sequence: str) -> float:
-    """计算肽链净电荷（pH 7.4 近似）"""
-    charge = sum(AA_CHARGE.get(aa, 0) for aa in sequence)
-    # N端氨基 +1，C端羧基 -1
+def get_net_charge(sequence) -> float:
+    amino_acids = parse_sequence(sequence)
+    charge = sum(AA_CHARGE.get(aa, 0) for aa in amino_acids)
     charge += 1 - 1
     return charge
 
@@ -399,35 +533,38 @@ def is_weight_valid(sequence: str) -> bool:
 # =============================================================================
 
 def validate_config():
-    """验证配置参数的一致性"""
-    # 检查模板长度
-    template_len = len(PEPTIDE_TEMPLATE)
-    
-    # 检查固定位置是否在范围内
+    # 模板长度 = 氨基酸数量（不是字符数）
+    template_aa = parse_sequence(PEPTIDE_TEMPLATE)
+    template_len = len(template_aa)
+
     for pos in FIXED_POSITIONS:
         if pos < 0 or pos >= template_len:
             raise ValueError(f"固定位置 {pos} 超出模板范围 [0, {template_len})")
-    
-    # 检查二硫键位置
+
+    # 二硫键检查（注意：PEPTIDE_TEMPLATE 里的 'x' 是占位符，不是氨基酸）
+    # 模板中 Cys 的位置由 FIXED_POSITIONS 决定
+    cys_positions_in_template = [
+        pos for pos, aa in FIXED_POSITIONS.items() if aa == 'C'
+    ]
+
     for cys1, cys2 in DISULFIDE_BONDS:
-        if PEPTIDE_TEMPLATE[cys1] != 'C' and cys1 not in FIXED_POSITIONS:
+        if cys1 not in cys_positions_in_template:
             raise ValueError(f"二硫键位置 {cys1} 不是半胱氨酸")
-        if PEPTIDE_TEMPLATE[cys2] != 'C' and cys2 not in FIXED_POSITIONS:
+        if cys2 not in cys_positions_in_template:
             raise ValueError(f"二硫键位置 {cys2} 不是半胱氨酸")
-    
-    # 检查可变位置
+
     var_pos = get_variable_positions()
     for pos in var_pos:
         if pos in FIXED_POSITIONS:
             raise ValueError(f"位置 {pos} 不能同时是固定位置和可变位置")
-    
+
     print("✓ 配置验证通过")
     return True
 
 if __name__ == "__main__":
     validate_config()
     print(f"肽模板: {PEPTIDE_TEMPLATE}")
-    print(f"模板长度: {len(PEPTIDE_TEMPLATE)}")
+    print(f"模板长度（氨基酸数）: {sequence_length(PEPTIDE_TEMPLATE)}")
     print(f"可变位置数: {len(VARIABLE_POSITIONS)}")
     print(f"二硫键配对: {DISULFIDE_BONDS}")
 
@@ -450,3 +587,29 @@ try:
 except ImportError:
     # 如果adaptive_mcts_config不存在，使用默认配置
     ADAPTIVE_MCTS_CONFIG = None
+
+
+# =============================================================================
+# 非天然氨基酸自动加载（不自动调用，由 run_phase2 显式调用）
+# =============================================================================
+def _auto_load_nonnatural():
+    """
+    启动时自动加载非天然氨基酸
+    
+    注意：不能在这里自动调用，因为 amino_acid_loader 会 import config，
+    形成循环导入。由 run_phase2_v4.py 在启动时显式调用。
+    """
+    amino_txt = BASE_DIR / "amino" / "AMINO.txt"
+    if not amino_txt.exists():
+        print("[config] 没有 amino/AMINO.txt，使用天然氨基酸")
+        return False
+    
+    try:
+        from amino_acid_loader import load_and_register
+        load_and_register()
+        return True
+    except Exception as e:
+        print(f"[config] 非天然氨基酸加载失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False

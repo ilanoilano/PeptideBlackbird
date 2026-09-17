@@ -29,6 +29,24 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import config
 
+# 加载非天然氨基酸（必须在所有使用 config 的模块之前调用）
+try:
+    from amino_acid_loader import load_and_register as _load_nonnatural_amino
+    _load_nonnatural_amino()
+except FileNotFoundError:
+    print("[run_phase2_v4] 没有 amino/AMINO.txt，使用天然氨基酸")
+except Exception as _e:
+    print(f"[run_phase2_v4] 非天然氨基酸加载失败: {_e}")
+    import traceback
+    traceback.print_exc()
+
+try:
+    from ligand_generator import load_nonnatural_smiles as _load_smiles
+    _load_smiles()
+except Exception as _e:
+    print(f"[run_phase2_v4] 非天然氨基酸SMILES加载失败: {_e}")
+
+
 # 导入MCTS模块
 from peptide_state import PeptideState, create_root_node, MCTSNode
 from selection import PUCTSelector
@@ -93,7 +111,7 @@ class AdaptiveMCTSEngineV3:
         self.results_dir.mkdir(parents=True, exist_ok=True)
         # EGNN模型
         self.egnn_model = None
-        self.egnn_model_path = config.BASE_DIR / "egnn" / "models" / "best_model.pt"
+        self.egnn_model_path = config.get_egnn_dirs(target_name)["models"] / "best_model.pt"
         self.selector = PUCTSelector(c_puct=config.MCTS_CONFIG["c_puct"])
         self.backprop_engine = BackpropagationEngine(verbose=False)
         # 初始化 ExpansionEngine
@@ -133,7 +151,7 @@ class AdaptiveMCTSEngineV3:
             print(f"错误: EGNN模型不存在: {self.egnn_model_path}")
             return False
         try:
-            self.egnn_model = create_egnn_predictor()
+            self.egnn_model = create_egnn_predictor(target_name=self.target_name)
             print(f"✓ EGNN模型加载成功")
             # 【新增】加载EGNN后，启用先验策略
             self.expansion_engine = ExpansionEngine(
@@ -547,7 +565,7 @@ class AdaptiveMCTSEngineV3:
             print("  [2/2] 训练EGNN模型 (EGNN_23.py)...")
             result = subprocess.run(
                 [
-                    sys.executable, "egnn_23.py",
+                    sys.executable, "EGNN_23.py",
                     "--target", self.target_name
                 ],
                 cwd=config.BASE_DIR,
@@ -620,15 +638,14 @@ class AdaptiveMCTSEngineV3:
     # =================================================================
 
     def _force_complete(self, partial_sequence: str) -> str:
-        """把 'x' 用随机氨基酸填满，保留已填的"""
-        seq_list = list(partial_sequence)
-        for i, c in enumerate(seq_list):
-            if c in ['x', 'X', '_']:
-                seq_list[i] = random.choice(config.ALLOWED_AMINO_ACIDS)
-        return ''.join(seq_list)
+
+        amino_acids = config.parse_sequence(partial_sequence)
+        for i, aa in enumerate(amino_acids):
+            if aa in ['x', 'X', '_']:
+                amino_acids[i] = random.choice(config.ALLOWED_AMINO_ACIDS)
+        return config.format_sequence(amino_acids)
 
     def _create_terminal_node(self, full_seq: str, parent: MCTSNode) -> MCTSNode:
-        """创建终端节点并插入树中"""
         terminal_state = PeptideState(
             sequence=full_seq,
             crosslinker=config.CROSSLINKER,
@@ -637,75 +654,160 @@ class AdaptiveMCTSEngineV3:
         terminal_state.is_sequence_complete = True
         terminal_state.is_topology_complete = True
 
+        amino_acids = config.parse_sequence(full_seq)
+        last_aa = amino_acids[-1] if amino_acids else "sim"
+
         terminal_node = MCTSNode(
             state=terminal_state,
             parent=parent,
             prior_prob=1.0,
             decision_level=1,
-            decision_action=full_seq[-1] if full_seq else "sim"
+            decision_action=last_aa
         )
-        parent.children[full_seq[-1] + "_term"] = terminal_node
+        parent.children[last_aa + "_term"] = terminal_node
         return terminal_node
 
     def mcts_iteration(self, root: MCTSNode) -> MCTSNode:
         """
-        执行一次完整的 MCTS 迭代，确保到达终端节点
-
-        关键修复：
-        1. Selection → Expansion 循环，直到终端节点被创建并插入树中
-        2. 终端节点的奖励沿完整路径回传
+        路径式 MCTS 一次迭代：
+          1. 从 root 走到底：
+             - 有 EGNN：PUCT 概率采样
+             - 无 EGNN：均匀采样（未访问优先）
+          2. 到 terminal，评估完整序列
+          3. 回传整条路径
         """
-        # 一、Selection: 从根走到当前最深的叶节点
-        path = self.selector.select_path(
-            root,
-            can_expand_fn=lambda node: self.expansion_engine.can_expand(node)
-        )
-        leaf = path[-1]
-
-        # 二、Expansion + 强制补全：从 leaf 开始，不断扩展直到终端
-        while not leaf.is_terminal:
-            # 检查是否可以继续扩展（还有可选的氨基酸）
-            if self.expansion_engine.can_expand(leaf):
-
-                # 【修复】max_expansions调大，一次生成一批候选子节点
-                new_children = self.expansion_engine.expand(leaf, max_expansions=10)
-                # ===== 这里插入DEBUG打印 =====
-                print(f"[DEBUG expand] partial={leaf.state.sequence}, new actions={list(new_children.keys())}")
-                if new_children:
-                    child_list = list(new_children.values())
-                    if self.expansion_engine.use_egnn_prior:
-                        # 有EGNN先验：使用PUCT从这批新生成子节点选一个
-                        child = self.selector.select(leaf)
-                    else:
-                        # 无EGNN先验(冷启动前期)：随机采样，避免永远选列表第一个A
-                        import random
-                        child = random.choice(child_list)
-                    path.append(child)
-                    leaf = child
-                    continue
-                else:
-                    # 无可用氨基酸，强制补全到终端
-                    full_seq = self._force_complete(leaf.state.sequence)
-                    terminal_node = self._create_terminal_node(full_seq, leaf)
-                    path.append(terminal_node)
-                    leaf = terminal_node
-                    break
-            else:
-                # 无法扩展，强制补全
-                full_seq = self._force_complete(leaf.state.sequence)
-                terminal_node = self._create_terminal_node(full_seq, leaf)
-                path.append(terminal_node)
-                leaf = terminal_node
+        import numpy as np
+        import math
+        
+        # ==================== 1. 从 root 走到底 ====================
+        path = [root]
+        current = root
+        visited = {id(root)}
+        max_depth = 200
+        
+        for _step in range(max_depth):
+            if current.is_terminal:
                 break
-
-        # 三、Simulation: 现在 leaf 一定是终端节点
-        energy = self.predict_with_egnn(leaf.state.sequence)
-        reward = self._energy_to_reward(energy)
-
-        # 四、Backpropagation: 把奖励沿完整路径回传
+            
+            all_actions = self.expansion_engine.get_all_possible_actions(current)
+            if not all_actions:
+                break
+            
+            action = None
+            child = None
+            
+            if self.egnn_model is None:
+                # ---------- 无 EGNN：均匀采样（未访问优先）----------
+                unvisited_actions = []
+                for a in all_actions:
+                    key = self.expansion_engine.action_to_key(a)
+                    if key not in current.children:
+                        unvisited_actions.append(a)
+                    elif current.children[key].visit_count == 0:
+                        unvisited_actions.append(a)
+                
+                if unvisited_actions:
+                    action = random.choice(unvisited_actions)
+                else:
+                    action = random.choice(all_actions)
+                
+                key = self.expansion_engine.action_to_key(action)
+                if key in current.children:
+                    child = current.children[key]
+                else:
+                    child = self.expansion_engine.expand_single(current, action)
+            else:
+                # ---------- 有 EGNN：PUCT 概率采样 ----------
+                c_puct = self.selector.c_puct
+                parent_visits = max(current.visit_count, 1)
+                
+                candidates = []
+                for a in all_actions:
+                    key = self.expansion_engine.action_to_key(a)
+                    if key in current.children:
+                        ch = current.children[key]
+                        q = ch.average_score
+                        u = c_puct * ch.prior_prob * math.sqrt(parent_visits) / (1 + ch.visit_count)
+                        score = q + u
+                        candidates.append((a, key, score, ch))
+                    else:
+                        prior = 1.0 / len(all_actions)
+                        u = c_puct * prior * math.sqrt(parent_visits)
+                        score = u
+                        candidates.append((a, key, score, None))
+                
+                unvisited = [(a, k, s, c) for (a, k, s, c) in candidates
+                             if c is None or c.visit_count == 0]
+                
+                if unvisited:
+                    priors = np.array([
+                        max((c.prior_prob if c is not None else 1.0 / len(all_actions)), 1e-8)
+                        for (_, _, _, c) in unvisited
+                    ], dtype=np.float64)
+                    s = priors.sum()
+                    probs = priors / s if s > 0 else np.ones(len(unvisited)) / len(unvisited)
+                    idx = int(np.random.choice(len(unvisited), p=probs))
+                    action, key, score, child = unvisited[idx]
+                else:
+                    scores = np.array([s for (_, _, s, _) in candidates], dtype=np.float64)
+                    temp = max(self.selector.temperature, 1e-6)
+                    scores = scores / temp
+                    scores = scores - scores.max()
+                    exp_s = np.exp(scores)
+                    denom = exp_s.sum()
+                    if denom > 0 and np.all(np.isfinite(exp_s)):
+                        probs = exp_s / denom
+                        idx = int(np.random.choice(len(candidates), p=probs))
+                    else:
+                        idx = int(np.argmax(scores))
+                    action, key, score, child = candidates[idx]
+                
+                if child is None:
+                    try:
+                        child = self.expansion_engine.expand_single(current, action)
+                    except Exception as e:
+                        print(f"[mcts_iteration] 创建子节点失败 action={action}: {e}")
+                        break
+            
+            if child is None:
+                break
+            
+            if id(child) in visited:
+                print(f"[mcts_iteration] 检测到环，停止")
+                break
+            visited.add(id(child))
+            
+            path.append(child)
+            current = child
+        
+        leaf = path[-1]
+        
+        # ==================== 2. 完整序列 ====================
+        if leaf.is_terminal:
+            full_seq = leaf.state.sequence
+        else:
+            amino_acids = config.parse_sequence(leaf.state.sequence)
+            for i, aa in enumerate(amino_acids):
+                if aa in ['_', 'x', 'X']:
+                    amino_acids[i] = random.choice(config.ALLOWED_AMINO_ACIDS)
+            full_seq = config.format_sequence(amino_acids)
+        
+        # ==================== 3. 评估 ====================
+        if self.egnn_model is not None:
+            try:
+                energy = self.predict_with_egnn(full_seq)
+                reward = self._energy_to_reward(energy)
+            except Exception as e:
+                print(f"[mcts_iteration] EGNN 评估失败: {e}, seq={full_seq}")
+                reward = 0.0
+        else:
+            reward = 0.0
+        
+        # ==================== 4. 回传 ====================
         self.backprop_engine.backpropagate(path, reward)
-
+        
         return root
+
 
     def _energy_to_reward(self, energy: float) -> float:
         """将结合能转换为 [0, 1] 奖励值"""
@@ -713,10 +815,12 @@ class AdaptiveMCTSEngineV3:
         return max(0.0, min(1.0, reward))
 
     def _heuristic_score(self, node: MCTSNode) -> float:
-        """启发式分数（备用）"""
         seq = node.state.sequence
-        completed = sum(1 for c in seq if c not in ['_', 'x', 'X'])
-        total = len(seq)
+        amino_acids = config.parse_sequence(seq)
+        completed = sum(1 for aa in amino_acids if aa not in ['_', 'x', 'X'])
+        total = len(amino_acids)
+        if total == 0:
+            return 0.0
         return 0.3 + 0.5 * (completed / total)
 
     def extract_top_candidates(self, root: MCTSNode, top_n: int = 100) -> List[Tuple[str, float]]:
@@ -951,13 +1055,60 @@ class AdaptiveMCTSEngineV3:
                 writer.writerow([seq, config.CROSSLINKER, '', energy, 'vina', timestamp])
 
     def _finetune_egnn(self, n_epochs: int = 20):
+        """
+        微调 EGNN
+        
+        数据集构建策略：
+          1. 合并全部历史 GNINA 验证数据（self.vina_validated）
+          2. 若数据量 > target_size：
+             - 按 energy 升序排序（越小越好）
+             - 取前 best_ratio 作为"最优样本"
+             - 从剩余样本中随机抽取 (1-best_ratio) 部分
+             - 合并为固定大小的训练集
+          3. 若数据量 <= target_size：全部使用
+        """
         if not self.vina_validated:
             print("  没有新数据，跳过微调")
             return
-
-        print(f"  微调 EGNN（使用 {len(self.vina_validated)} 个数据，{n_epochs} epochs）...")
-        data = list(self.vina_validated.items())
+        
+        finetune_cfg = config.FINETUNE_CONFIG
+        target_size = finetune_cfg.get("target_size", 100)
+        best_ratio = finetune_cfg.get("best_ratio", 0.8)
+        random_seed = finetune_cfg.get("random_seed", 42)
+        
+        combined = dict(self.vina_validated)
+        total = len(combined)
+        
+        print(f"  微调 EGNN（历史数据 {total} 个，目标 {target_size} 个）...")
+        
+        if total > target_size:
+            sorted_items = sorted(combined.items(), key=lambda x: x[1])
+            
+            n_best = int(target_size * best_ratio)
+            n_random = target_size - n_best
+            
+            best = sorted_items[:n_best]
+            rest = sorted_items[n_best:]
+            
+            import random as _random
+            _random.seed(random_seed)
+            _random.shuffle(rest)
+            random_part = rest[:n_random]
+            
+            data = best + random_part
+            
+            best_energies = [e for _, e in best]
+            random_energies = [e for _, e in random_part]
+            print(f"    最优 {n_best} 个: energy 范围 "
+                  f"[{min(best_energies):.2f}, {max(best_energies):.2f}]")
+            print(f"    随机 {n_random} 个: energy 范围 "
+                  f"[{min(random_energies):.2f}, {max(random_energies):.2f}]")
+        else:
+            data = list(combined.items())
+            print(f"    数据量 < {target_size}，全部使用")
+        
         self._train_egnn(data, n_epochs=n_epochs)
+
 
 
 # =================================================================

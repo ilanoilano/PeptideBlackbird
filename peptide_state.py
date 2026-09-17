@@ -52,20 +52,22 @@ class PeptideState:
     # 决策层标记
     is_sequence_complete: bool = False           # 序列是否填完
     is_topology_complete: bool = False           # 拓扑是否确定
-    
+
     def __post_init__(self):
-        """初始化后检查状态一致性"""
         if not self.sequence:
-            self.sequence = config.PEPTIDE_TEMPLATE.replace('x', '_')
-        
-        # 自动判断完成状态
+            # 【关键】模板里的 'x' 替换为 '_'（占位符）
+            # PEPTIDE_TEMPLATE 是字符串（如 "ACxxxCxxxCG"）
+            self.sequence = config.PEPTIDE_TEMPLATE.replace('x', '_').replace('X', '_')
         self._update_completion_status()
-    
+
     def _update_completion_status(self):
-        """更新完成状态"""
-        # 序列完成：没有占位符
-        self.is_sequence_complete = '_' not in self.sequence and 'x' not in self.sequence.lower()
-        
+        # 字符串检查占位符
+        seq_str = self.sequence if isinstance(self.sequence, str) else config.format_sequence(self.sequence)
+        self.is_sequence_complete = (
+                '_' not in seq_str and
+                'x' not in seq_str and
+                'X' not in seq_str
+        )
         # 拓扑完成：
         # - 如果选择了交联剂（TBMB/TATA/TBAB），拓扑自动完成
         # - 如果选择了disulfide，需要至少一对二硫键
@@ -100,10 +102,11 @@ class PeptideState:
             elif self.crosslinker == "disulfide" and not self.disulfide_bonds:
                 return 3  # 需要选择二硫键
         return 0  # 已完成
-    
+
     def get_cys_positions(self) -> List[int]:
-        """获取序列中所有Cys的位置"""
-        return [i for i, aa in enumerate(self.sequence) if aa == 'C']
+        """返回 Cys 在氨基酸序列中的位置（氨基酸索引，不是字符索引）"""
+        amino_acids = config.parse_sequence(self.sequence)
+        return [i for i, aa in enumerate(amino_acids) if aa == 'C']
     
     def get_possible_crosslinkers(self) -> List[Optional[str]]:
         """
@@ -146,12 +149,12 @@ class PeptideState:
             is_sequence_complete=self.is_sequence_complete,
             is_topology_complete=self.is_topology_complete
         )
-    
+
     def to_key(self) -> str:
-        """转换为唯一标识符（用于字典key）"""
         bonds_str = "|".join(f"{i}-{j}" for i, j in self.disulfide_bonds)
-        return f"{self.sequence}_{self.crosslinker}_{bonds_str}"
-    
+        seq_str = self.sequence if isinstance(self.sequence, str) else config.format_sequence(self.sequence)
+        return f"{seq_str}_{self.crosslinker}_{bonds_str}"
+
     def __repr__(self) -> str:
         level = self.decision_level
         level_str = {0: "Complete", 1: "Seq", 2: "Xlinker", 3: "Disulfide"}.get(level, "Unknown")

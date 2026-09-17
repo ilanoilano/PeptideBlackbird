@@ -341,6 +341,9 @@ def main(model_path: Optional[Path] = None,
     else:
         # fallback：使用原默认路径
         if model_path is None:
+            if target_name is not None:
+            model_path = config.get_egnn_dirs(target_name)["models"] / "best_model.pt"
+        else:
             model_path = config.BASE_DIR / "egnn" / "models" / "best_model.pt"
         if test_data_path is None:
             test_data_path = config.BASE_DIR / "egnn" / "raw" / "test_data.npz"

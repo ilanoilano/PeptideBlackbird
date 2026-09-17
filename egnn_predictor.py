@@ -146,6 +146,7 @@ class EGNNPredictor:
     """
 
     def __init__(self, model_path: Optional[Path] = None,
+                 target_name: Optional[str] = None,
                  hidden_dim: int = None, num_layers: int = None):
         """
         初始化预测器
@@ -156,7 +157,10 @@ class EGNNPredictor:
             num_layers: EGNN层数（默认从config读取）
         """
         if model_path is None:
-            model_path = config.BASE_DIR / "egnn" / "models" / "best_model.pt"
+            if target_name is not None:
+                model_path = config.get_egnn_dirs(target_name)["models"] / "best_model.pt"
+            else:
+                model_path = config.BASE_DIR / "egnn" / "models" / "best_model.pt" 
 
         # 【修复】从 config 读取，而不是硬编码
         if hidden_dim is None:
@@ -345,33 +349,34 @@ class EGNNPredictor:
             raise
 
 
-def create_egnn_predictor() -> EGNNPredictor:
+def create_egnn_predictor(target_name: Optional[str] = None) -> EGNNPredictor:
     """
     创建EGNN预测器（如果模型存在）
     
-    Returns:
-        EGNNPredictor实例
-    
-    Raises:
-        FileNotFoundError: 如果模型文件不存在
-        RuntimeError: 如果模型加载失败
+    Args:
+        target_name: 靶点名称。若提供，从 egnn/{target}/models/ 加载；
+                    否则从 egnn/models/ 加载。
     """
-    model_path = config.BASE_DIR / "egnn" / "models" / "best_model.pt"
-    
+    if target_name is not None:
+        model_path = config.get_egnn_dirs(target_name)["models"] / "best_model.pt"
+    else:
+        model_path = config.BASE_DIR / "egnn" / "models" / "best_model.pt"
+
     if not model_path.exists():
         print(f"【EGNN错误】模型文件不存在: {model_path}")
         print("  请先运行以下步骤训练模型:")
         print("    1. python EGNN_1.py  # 准备数据")
         print("    2. python EGNN_23.py  # 训练模型")
         raise FileNotFoundError(f"EGNN模型不存在: {model_path}")
-    
+
     try:
-        predictor = EGNNPredictor(model_path)
+        predictor = EGNNPredictor(model_path=model_path, target_name=target_name)
         print(f"【EGNN】模型加载成功: {model_path}")
         return predictor
     except Exception as e:
         print(f"【EGNN错误】模型加载失败: {e}")
         raise RuntimeError(f"无法加载EGNN模型: {e}") from e
+
 
 
 def main():

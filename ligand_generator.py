@@ -31,10 +31,200 @@ TEMP_DIR = config.BASE_DIR / "temp" / "ligand_generator"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def is_carboxyl_carbon(mol, atom_idx):
+    """
+    检查一个碳原子是否是羧基碳（C(=O)O）
+
+    Args:
+        mol: RDKit分子
+        atom_idx: 碳原子索引
+
+    Returns:
+        bool: 是否是羧基碳
+    """
+    from rdkit import Chem
+
+    atom = mol.GetAtomWithIdx(atom_idx)
+
+    if atom.GetAtomicNum() != 6:
+        return False
+
+    has_double_o = False
+    has_single_o = False
+
+    for neighbor in atom.GetNeighbors():
+        if neighbor.GetAtomicNum() != 8:
+            continue
+
+        bond = mol.GetBondBetweenAtoms(atom_idx, neighbor.GetIdx())
+        if bond.GetBondType() == Chem.BondType.DOUBLE:
+            has_double_o = True
+        elif bond.GetBondType() == Chem.BondType.SINGLE:
+            has_single_o = True
+
+    return has_double_o and has_single_o
+
+
+def find_carboxyl_carbon(mol):
+    """
+    找到C端羧基碳（排除侧链羧基，如Asp/Glu）
+
+    鲁棒版：只返回主链羧基碳
+
+    Args:
+        mol: RDKit分子
+
+    Returns:
+        (羧基碳索引, 单键氧索引)，找不到返回 (None, None)
+    """
+    from rdkit import Chem
+    candidates = []
+
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() != 6:
+            continue
+
+        if not is_carboxyl_carbon(mol, atom.GetIdx()):
+            continue
+
+        # 找到单键氧（OH）
+        o_single = None
+        for neighbor in atom.GetNeighbors():
+            if neighbor.GetAtomicNum() == 8:
+                bond = mol.GetBondBetweenAtoms(atom.GetIdx(), neighbor.GetIdx())
+                if bond.GetBondType() == Chem.BondType.SINGLE:
+                    o_single = neighbor.GetIdx()
+                    break
+
+        if o_single is None:
+            continue
+
+        # 检查这个羧基碳是否连接α碳
+        # α碳的特征：连接一个非芳香氮
+        is_main_chain = False
+        for neighbor in atom.GetNeighbors():
+            if neighbor.GetAtomicNum() != 6:
+                continue
+
+            for alpha_neighbor in neighbor.GetNeighbors():
+                if alpha_neighbor.GetAtomicNum() != 7:
+                    continue
+                if alpha_neighbor.GetIsAromatic():
+                    continue
+                is_main_chain = True
+                break
+
+            if is_main_chain:
+                break
+
+        if is_main_chain:
+            candidates.append((atom.GetIdx(), o_single))
+
+    if not candidates:
+        # 回退到旧逻辑
+        return _fallback_find_carboxyl_carbon(mol)
+
+    return candidates[0]
+
+
+def _fallback_find_carboxyl_carbon(mol):
+    """回退逻辑：旧版 find_carboxyl_carbon"""
+    from rdkit import Chem
+
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 6:
+            o_double = None
+            o_single = None
+            for neighbor in atom.GetNeighbors():
+                if neighbor.GetAtomicNum() == 8:
+                    bond = mol.GetBondBetweenAtoms(atom.GetIdx(), neighbor.GetIdx())
+                    if bond.GetBondType() == Chem.BondType.DOUBLE:
+                        o_double = neighbor.GetIdx()
+                    elif bond.GetBondType() == Chem.BondType.SINGLE:
+                        o_single = neighbor.GetIdx()
+            if o_double is not None and o_single is not None:
+                is_main_chain = False
+                for neighbor in atom.GetNeighbors():
+                    if neighbor.GetAtomicNum() == 6:
+                        for ca_neighbor in neighbor.GetNeighbors():
+                            if ca_neighbor.GetAtomicNum() == 7:
+                                is_main_chain = True
+                                break
+                if is_main_chain:
+                    return atom.GetIdx(), o_single
+    return None, None
+
+
+def find_amino_nitrogen(mol):
+    """
+    找到α-氨基氮（N端）
+
+    鲁棒版：只返回真正的α-氨基氮，不返回侧链氨基
+
+    Args:
+        mol: RDKit分子
+
+    Returns:
+        α-氨基氮的原子索引，找不到返回None
+    """
+    candidates = []
+
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() != 7:
+            continue
+
+        # 跳过芳香氮
+        if atom.GetIsAromatic():
+            continue
+
+        # 跳过带正电的氮
+        if atom.GetFormalCharge() > 0:
+            continue
+
+        # 检查这个氮是否连接α碳
+        for neighbor in atom.GetNeighbors():
+            if neighbor.GetAtomicNum() != 6:
+                continue
+
+            alpha_carbon = neighbor
+
+            # 检查α碳是否连接羧基碳
+            has_carboxyl = False
+            for alpha_neighbor in alpha_carbon.GetNeighbors():
+                if alpha_neighbor.GetAtomicNum() != 6:
+                    continue
+
+                if is_carboxyl_carbon(mol, alpha_neighbor.GetIdx()):
+                    has_carboxyl = True
+                    break
+
+            if has_carboxyl:
+                candidates.append((atom.GetIdx(), alpha_carbon.GetIdx()))
+                break
+
+    if not candidates:
+        return _fallback_find_amino_nitrogen(mol)
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][0]
+
+
+def _fallback_find_amino_nitrogen(mol):
+    """回退逻辑：旧版 find_amino_nitrogen"""
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 7:
+            neighbors = list(atom.GetNeighbors())
+            carbon_count = sum(1 for n in neighbors if n.GetAtomicNum() == 6)
+            if carbon_count >= 1 and carbon_count <= 2:
+                return atom.GetIdx()
+    return None
+
+
 # 氨基酸SMILES（N端游离，C端羧基）
-AA_SMILES = {
+# 天然氨基酸SMILES（硬编码，带占位符 [N]）
+AA_SMILES_NATURAL = {
     'A': '[N][C@@H](C)C(=O)O',
-    'C': '[N][C@@H](CS)C(=O)O',  # Cys有硫原子S
+    'C': '[N][C@@H](CS)C(=O)O',
     'D': '[N][C@@H](CC(=O)O)C(=O)O',
     'E': '[N][C@@H](CCC(=O)O)C(=O)O',
     'F': '[N][C@@H](Cc1ccccc1)C(=O)O',
@@ -55,140 +245,224 @@ AA_SMILES = {
     'Y': '[N][C@@H](Cc1ccc(O)cc1)C(=O)O',
 }
 
-# 交联剂SMILES
-# 【修复】TBMB使用Kekulé形式（明确指定双键），避免芳香环kekulization问题
+# 非天然氨基酸SMILES（运行时从 amino/AMINO.txt 加载）
+# key 是氨基酸名称（如 "Aib", "Nle"）
+AA_SMILES_NONNATURAL = {}
+# 合并后的字典（运行时由 load_nonnatural_smiles 填充）
+AA_SMILES = {**AA_SMILES_NATURAL, **AA_SMILES_NONNATURAL}
+
+
+# =============================================================================
+# 交联剂 SMILES
+# =============================================================================
+# 【说明】TBMB 使用 Kekulé 形式（明确指定双键），避免芳香环 kekulization 问题
 CROSSLINKER_SMILES = {
-    "TBMB": "BrCC1=CC(CBr)=CC(CBr)=C1",  # Kekulé形式，明确双键
+    "TBMB": "BrCC1=CC(CBr)=CC(CBr)=C1",       # Kekulé 形式
     "TATA": "C(CS)(CS)CS",
-    "TBAB": "C1=C(CBr)C=C(CBr)C(CBr)=C1CBr",  # Kekulé形式
+    "TBAB": "C1=C(CBr)C=C(CBr)C(CBr)=C1CBr",   # Kekulé 形式
 }
 
 
-def find_carboxyl_carbon(mol):
-    """找到 C 端羧基碳（排除侧链羧基，如 Asp/Glu）"""
+
+
+
+
+
+
+def _convert_to_placeholder_smiles(smiles: str) -> str:
+    """
+    把完整氨基酸 SMILES 转成带 [N] 占位符的形式
+
+    输入: "CC(C)(N)C(=O)O"
+    输出: "CC(C)([N])C(=O)O"（或类似）
+
+    关键：
+    - RDKit 输出 N 时通常带显式氢（如 [NH2:4]）
+    - 需要把 [N(Hn):map] 统一替换为 [N]
+    """
     from rdkit import Chem
+    import re
 
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise RuntimeError(f"无法解析 SMILES: {smiles}")
+
+    n_idx = find_amino_nitrogen(mol)
+    if n_idx is None:
+        raise RuntimeError(f"找不到 α-氨基氮: {smiles}")
+
+    # 给所有原子加原子映射号（1-based）
     for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() == 6:  # 碳
-            o_double = None
-            o_single = None
+        atom.SetAtomMapNum(atom.GetIdx() + 1)
 
-            for neighbor in atom.GetNeighbors():
-                if neighbor.GetAtomicNum() == 8:  # 氧
-                    bond = mol.GetBondBetweenAtoms(atom.GetIdx(), neighbor.GetIdx())
-                    if bond.GetBondType() == Chem.BondType.DOUBLE:
-                        o_double = neighbor.GetIdx()
-                    elif bond.GetBondType() == Chem.BondType.SINGLE:
-                        o_single = neighbor.GetIdx()
+    mapped_smiles = Chem.MolToSmiles(mol)
+    map_num = n_idx + 1
 
-            if o_double is not None and o_single is not None:
-                # 【关键】检查这个羧基碳是否是主链上的（连接了 CA 和 N）
-                # C 端羧基碳应该连接一个 CA（α碳），CA 又连接一个 N
-                is_main_chain = False
-                for neighbor in atom.GetNeighbors():
-                    if neighbor.GetAtomicNum() == 6:  # 碳（CA）
-                        # 检查 CA 是否连接了一个 N
-                        for ca_neighbor in neighbor.GetNeighbors():
-                            if ca_neighbor.GetAtomicNum() == 7:  # 氮
-                                is_main_chain = True
-                                break
+    # 【修正】匹配 [N...:map_num]，其中 ... 可能是空、H、H2、H3
+    pattern = rf'\[N[H0-9]*:{map_num}\]'
 
-                if is_main_chain:
-                    return atom.GetIdx(), o_single
+    if not re.search(pattern, mapped_smiles):
+        raise RuntimeError(
+            f"无法定位 α-氨基 N 的映射标记。"
+            f"mapped_smiles={mapped_smiles}, n_idx={n_idx}, map_num={map_num}"
+        )
 
-    return None, None
+    new_smiles = re.sub(pattern, '[N]', mapped_smiles)
+
+    # 去掉其他原子映射号
+    new_smiles = re.sub(r':\d+\]', ']', new_smiles)
+    new_smiles = re.sub(r':\d+', '', new_smiles)
+
+    return new_smiles
 
 
-def find_amino_nitrogen(mol):
-    """找到氨基氮（N端）"""
-    for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() == 7:  # 氮
-            neighbors = list(atom.GetNeighbors())
-            carbon_count = sum(1 for n in neighbors if n.GetAtomicNum() == 6)
-            
-            if carbon_count >= 1 and carbon_count <= 2:
-                return atom.GetIdx()
-    
-    return None
+def load_nonnatural_smiles(txt_path=None) -> dict:
+    """
+    从 amino/AMINO.txt 加载非天然氨基酸的SMILES，并转成占位符形式
+    """
+    from amino_acid_loader import parse_amino_txt
+
+    amino_dict = parse_amino_txt(txt_path)
+
+    AA_SMILES_NONNATURAL.clear()
+    for name, smiles in amino_dict.items():
+        try:
+            placeholder_smiles = _convert_to_placeholder_smiles(smiles)
+            AA_SMILES_NONNATURAL[name] = placeholder_smiles
+            print(f"  [{name}] {smiles} -> {placeholder_smiles}")
+        except Exception as e:
+            print(f"  [警告] {name} 转换失败: {e}，使用原 SMILES")
+            AA_SMILES_NONNATURAL[name] = smiles
+
+    AA_SMILES.clear()
+    AA_SMILES.update(AA_SMILES_NATURAL)
+    AA_SMILES.update(AA_SMILES_NONNATURAL)
+
+    print(f"[ligand_generator] 已加载 {len(AA_SMILES_NONNATURAL)} 个非天然氨基酸SMILES")
+    return AA_SMILES_NONNATURAL
 
 
-def build_peptide_with_rdkit(sequence: str) -> 'Chem.Mol':
-    """使用RDKit构建肽链"""
+
+def build_peptide_with_rdkit(sequence) -> 'Chem.Mol':
+    """
+    从氨基酸序列构建肽分子
+
+    支持：
+    - 天然氨基酸（单大写字母，如 "A", "C", "D"）
+    - 非天然氨基酸（大写字母 + 后续小写字母，如 "Aib", "Nle"）
+
+    Args:
+        sequence: 氨基酸序列
+                  - 字符串形式：如 "ACAibCG"
+                  - 列表形式：如 ["A", "C", "Aib", "C", "G"]
+
+    Returns:
+        RDKit 分子对象
+
+    Raises:
+        RuntimeError: RDKit 未安装
+        ValueError: 序列为空
+        RuntimeError: 未知氨基酸或 SMILES 解析失败
+    """
     try:
         from rdkit import Chem
     except ImportError:
         raise RuntimeError("RDKit未安装")
-    
-    if not sequence:
+
+    # 【关键改动1】解析为氨基酸名称列表
+    amino_acids = config.parse_sequence(sequence)
+
+    if not amino_acids:
         raise ValueError("序列为空")
-    
+
     try:
-        if len(sequence) == 1:
-            smiles = AA_SMILES.get(sequence[0], AA_SMILES['A'])
+        # ============================================================
+        # 情况1：单个氨基酸
+        # ============================================================
+        if len(amino_acids) == 1:
+            aa = amino_acids[0]
+            smiles = AA_SMILES.get(aa)
+            if smiles is None:
+                raise RuntimeError(f"未知氨基酸: '{aa}'（不在 AA_SMILES 中）")
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
-                raise RuntimeError(f"无法解析氨基酸: {sequence[0]}")
+                raise RuntimeError(f"无法解析氨基酸 SMILES: {aa} -> {smiles}")
             return mol
-        
-        # 创建第一个氨基酸
-        first_aa = sequence[0]
-        first_smiles = AA_SMILES.get(first_aa, AA_SMILES['A'])
+
+        # ============================================================
+        # 情况2：多个氨基酸，逐个拼接
+        # ============================================================
+        # 第一个氨基酸
+        first_aa = amino_acids[0]
+        first_smiles = AA_SMILES.get(first_aa)
+        if first_smiles is None:
+            raise RuntimeError(f"未知氨基酸: '{first_aa}'（位置 0）")
         mol = Chem.MolFromSmiles(first_smiles)
         if mol is None:
-            raise RuntimeError(f"无法解析第一个氨基酸: {first_aa}")
-        
-        # 逐个添加氨基酸
-        for i in range(1, len(sequence)):
-            aa = sequence[i]
-            aa_smiles = AA_SMILES.get(aa, AA_SMILES['A'])
-            
+            raise RuntimeError(f"无法解析第一个氨基酸: {first_aa} -> {first_smiles}")
+
+        # 逐个添加剩余氨基酸
+        for i in range(1, len(amino_acids)):
+            aa = amino_acids[i]
+            aa_smiles = AA_SMILES.get(aa)
+            if aa_smiles is None:
+                raise RuntimeError(f"未知氨基酸: '{aa}'（位置 {i}）")
+
             next_mol = Chem.MolFromSmiles(aa_smiles)
             if next_mol is None:
-                print(f"【警告】无法解析氨基酸 {aa}，跳过")
-                continue
-            
+                raise RuntimeError(f"无法解析氨基酸: {aa}（位置 {i}） -> {aa_smiles}")
+
             n_prev = mol.GetNumAtoms()
-            
             c_atom_idx, oh_atom_idx = find_carboxyl_carbon(mol)
             n_atom_idx = find_amino_nitrogen(next_mol)
-            
-            if c_atom_idx is None or oh_atom_idx is None or n_atom_idx is None:
-                print(f"【警告】第{i}个氨基酸：找不到连接点，简单合并")
-                mol = Chem.CombineMols(mol, next_mol)
-                continue
-            
-            # 合并分子
+            if c_atom_idx is None or oh_atom_idx is None:
+                raise RuntimeError(
+                    f"位置 {i}（氨基酸 '{aa}'）：找不到当前肽链的 C 端羧基"
+                )
+            if n_atom_idx is None:
+                raise RuntimeError(
+                    f"位置 {i}（氨基酸 '{aa}'）：找不到 α-氨基氮"
+                )
+
+            # 【关键】把 next_mol 的 N 索引映射到 combined 坐标系
+            n_idx_in_combined = n_atom_idx + n_prev
+
+            # 合并两个分子
             combined = Chem.CombineMols(mol, next_mol)
             editable = Chem.EditableMol(combined)
-            
+
             # 删除羟基（OH）
             editable.RemoveAtom(oh_atom_idx)
-            
-            # 调整氮原子索引
-            if n_atom_idx > oh_atom_idx:
-                n_atom_idx -= 1
-            
+
+            # 【关键】删除 OH 后，所有索引 > oh_atom_idx 的原子索引减 1
+            c_atom_idx_adj = c_atom_idx
+            n_idx_adj = n_idx_in_combined
+            if c_atom_idx_adj > oh_atom_idx:
+                c_atom_idx_adj -= 1
+            if n_idx_adj > oh_atom_idx:
+                n_idx_adj -= 1
+
             # 创建肽键（C-N）
-            editable.AddBond(c_atom_idx, n_atom_idx + n_prev - (1 if oh_atom_idx < n_prev else 0), 
-                           Chem.BondType.SINGLE)
-            
+            editable.AddBond(c_atom_idx_adj, n_idx_adj, Chem.BondType.SINGLE)
             mol = editable.GetMol()
-        
-        # Sanitize
         try:
             Chem.SanitizeMol(mol)
-        except:
-            Chem.SanitizeMol(
-                mol,
-                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ 
-                           Chem.SanitizeFlags.SANITIZE_KEKULIZE
-            )
-        
+        except Exception as e:
+            # 尝试跳过 kekulization
+            try:
+                Chem.SanitizeMol(
+                    mol,
+                    sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^
+                               Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+            except Exception as e2:
+                raise RuntimeError(f"分子 sanitize 失败: {e2}")
         return mol
-        
+    except RuntimeError:
+        # 直接重新抛出我们的自定义错误
+        raise
     except Exception as e:
+        # 其他异常统一包装
         raise RuntimeError(f"构建肽链失败: {e}")
-
 
 def find_cys_sulfur_atoms(mol, sequence):
     """
@@ -207,7 +481,7 @@ def find_cys_sulfur_atoms(mol, sequence):
         List[硫原子索引]，按序列中 Cys 的出现顺序排列
     """
     from rdkit import Chem
-
+    amino_acids = config.parse_sequence(sequence)
     # 方法：利用 RDKit 构建顺序，S 原子的出现顺序与序列中 Cys 的顺序一致
     # 但需要区分 Met 的 S（Met 的 S 在侧链末端，Cys 的 S 靠近主链）
 
@@ -261,7 +535,7 @@ def find_cys_sulfur_atoms(mol, sequence):
             cys_sulfur_indices.append(atom.GetIdx())
 
     # 验证
-    expected_cys = sum(1 for aa in sequence if aa == 'C')
+    expected_cys = sum(1 for aa in amino_acids if aa == 'C')
     if len(cys_sulfur_indices) != expected_cys:
         print(f"【警告】序列中有 {expected_cys} 个 Cys，"
               f"但找到 {len(cys_sulfur_indices)} 个 Cys 的 S，"
@@ -275,6 +549,7 @@ def add_crosslinker(mol: 'Chem.Mol',
                     cys_positions: List[int],
                     sequence: str) -> 'Chem.Mol':
     from rdkit import Chem
+    amino_acids = config.parse_sequence(sequence)
     if crosslinker_type not in CROSSLINKER_SMILES:
         print(f"【警告】未知交联剂类型: {crosslinker_type}，跳过添加")
         return mol
@@ -292,9 +567,9 @@ def add_crosslinker(mol: 'Chem.Mol',
 
     selected_sulfur_local = []
     for pos in cys_positions:
-        if pos < len(sequence) and sequence[pos] == 'C':
+        if pos < len(amino_acids) and amino_acids[pos] == 'C':
             cys_count = 0
-            for i, aa in enumerate(sequence):
+            for i, aa in enumerate(amino_acids):
                 if aa == 'C':
                     if i == pos and cys_count < len(cys_sulfur_local_indices):
                         selected_sulfur_local.append(cys_sulfur_local_indices[cys_count])
@@ -842,8 +1117,7 @@ def generate_ligand(sequence: str, target_name: Optional[str] = None,
         output_dir = Path(output_dir)
     
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    seq_hash = hashlib.md5(f"{sequence}_{crosslinker}".encode()).hexdigest()[:8]
+    seq_hash = hashlib.md5(f"{config.format_sequence(sequence)}_{crosslinker}".encode()).hexdigest()[:8]
     output_pdbqt = output_dir / f"peptide_{seq_hash}.pdbqt"
     print(f"构建肽链：{sequence}")
     # 1. 构建肽链

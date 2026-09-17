@@ -25,36 +25,30 @@ import config
 
 def generate_full_sequence(partial_sequence: Optional[str] = None) -> str:
     """
-    生成完整序列，只替换 'x'/'X'/'_' 位置的氨基酸
-    
+    生成完整序列，只替换占位符位置的氨基酸
+
     Args:
-        partial_sequence: 部分序列（可能包含占位符）
-                         如果为None，使用config中的模板
-    
+        partial_sequence: 部分序列字符串（可能包含占位符）
+                        如果为 None，使用 config.PEPTIDE_TEMPLATE
+
     Returns:
-        完整序列（无占位符）
-    
-    示例：
-        "AC_____C______CG" → "ACARNDCMVFLWPCG"
-        "ACARNDC______CG" → "ACARNDCMVFLWPCG"（保留已填充位置）
+        完整序列字符串（可能包含非天然氨基酸）
     """
     if partial_sequence is None:
         partial_sequence = config.PEPTIDE_TEMPLATE
-    
-    seq_list = list(partial_sequence)
-    
-    for i, char in enumerate(seq_list):
-        # 只替换占位符
-        if char in ['x', 'X', '_']:
-            # 检查是否是固定位置（理论上不应该有占位符在固定位置）
+
+    # 【关键】解析为氨基酸列表
+    amino_acids = config.parse_sequence(partial_sequence)
+
+    for i, aa in enumerate(amino_acids):
+        if aa in ['x', 'X', '_']:
             if i in config.FIXED_POSITIONS:
-                seq_list[i] = config.FIXED_POSITIONS[i]
+                amino_acids[i] = config.FIXED_POSITIONS[i]
             else:
-                # 从该位置允许的氨基酸中随机选择
                 allowed_aas = config.VARIABLE_AMINO_ACIDS.get(i, config.ALLOWED_AMINO_ACIDS)
-                seq_list[i] = random.choice(allowed_aas)
-    
-    return ''.join(seq_list)
+                amino_acids[i] = random.choice(allowed_aas)
+
+    return config.format_sequence(amino_acids)
 
 
 def generate_multiple_sequences(n_sequences: int,
@@ -77,39 +71,23 @@ def generate_multiple_sequences(n_sequences: int,
 
 
 def generate_n_random_fills(partial_sequence: str, n: int) -> List[str]:
-    """
-    【新增】为部分序列生成N个不同的随机填充完整序列
-
-    这是新流程的核心函数：
-    - 保留已填充的氨基酸
-    - 对每个占位符独立随机选择氨基酸
-    - 生成N个不同的完整序列
-
-    Args:
-        partial_sequence: 部分序列（如 "AC_D_C___CG"）
-        n: 需要生成的序列数量
-
-    Returns:
-        N个不同的完整序列列表
-
-    示例：
-        Input:  "AC_D_C___CG", n=3
-        Output: ["ACADACDEFCG", "ACPDGCHQWCG", "ACRDVCMLKCG"]
-    """
     if not partial_sequence:
         raise ValueError("partial_sequence 不能为空")
 
     sequences = []
+    seen = set()
     attempts = 0
-    max_attempts = n * 10  # 防止无限循环
+    max_attempts = n * 20  # 提高上限
 
     while len(sequences) < n and attempts < max_attempts:
         attempts += 1
         seq = generate_full_sequence(partial_sequence)
-
-        # 确保不重复
-        if seq not in sequences:
+        if seq not in seen:
+            seen.add(seq)
             sequences.append(seq)
+
+    if len(sequences) < n:
+        print(f"[警告] 只生成了 {len(sequences)}/{n} 个不同序列（可能空间不足）")
 
     return sequences
 

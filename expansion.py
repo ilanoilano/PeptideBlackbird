@@ -70,30 +70,54 @@ class ExpansionEngine:
         else:
             print(f"【ExpansionEngine】警告：无先验策略，使用均匀分布")
     
-    def get_next_variable_position(self, sequence: str) -> Optional[int]:
-        """获取下一个可变位置（'_'或'x'）"""
-        for i, char in enumerate(sequence):
-            if char in ['_', 'x', 'X']:
+    def get_next_variable_position(self, sequence) -> Optional[int]:
+        """
+        获取下一个可变位置（氨基酸索引，不是字符索引）
+        
+        注意：序列可能含非天然氨基酸（如 Aib、Cha），
+        字符索引 != 氨基酸索引。必须用 parse_sequence 解析后遍历。
+        """
+        amino_acids = config.parse_sequence(sequence)
+        for i, aa in enumerate(amino_acids):
+            if aa in ['_', 'x', 'X']:
                 if i not in self.fixed_positions:
                     return i
         return None
-    
+
     def get_allowed_amino_acids(self, position: int) -> List[str]:
         """获取指定位置允许的氨基酸"""
         return self.variable_amino_acids.get(position, config.ALLOWED_AMINO_ACIDS)
-    
-    def fill_sequence(self, sequence: str, position: int, amino_acid: str) -> str:
-        """在指定位置填充氨基酸"""
-        seq_list = list(sequence)
-        
-        # 确保长度匹配
-        if len(seq_list) != len(self.template):
-            seq_list = ['_'] * len(self.template)
+
+    def fill_sequence(self, sequence, position: int, amino_acid: str) -> str:
+        """
+        在指定位置填充氨基酸
+
+        Args:
+            sequence: 当前序列（字符串或列表）
+            position: 要填充的位置（氨基酸索引，从 0 开始）
+            amino_acid: 要填充的氨基酸名称（如 "A"、"Aib"）
+        Returns:
+            填充后的序列（字符串形式）
+        """
+        # 【关键1】解析为氨基酸列表
+        amino_acids = config.parse_sequence(sequence)
+
+        # 【关键2】如果长度不匹配（比如序列被截断了），重建
+        template_aa = config.parse_sequence(self.template)
+        if len(amino_acids) != len(template_aa):
+            # 用模板重建，填上固定位置
+            amino_acids = list(template_aa)  # 模板里 'x' 保持不变
             for pos, aa in self.fixed_positions.items():
-                seq_list[pos] = aa
-        
-        seq_list[position] = amino_acid
-        return ''.join(seq_list)
+                amino_acids[pos] = aa
+
+        # 【关键3】用氨基酸索引填充
+        if position < 0 or position >= len(amino_acids):
+            raise IndexError(f"位置 {position} 超出序列范围 [0, {len(amino_acids)})")
+
+        amino_acids[position] = amino_acid
+
+        # 【关键4】拼回字符串
+        return config.format_sequence(amino_acids)
     
     def calculate_prior(self, context: dict) -> float:
         """
@@ -368,7 +392,10 @@ class ExpansionEngine:
                     'sequence': sequence,
                     'position': next_pos,
                     'amino_acid': aa,
-                    'depth': sum(1 for c in sequence if c not in ['_', 'x', 'X'])
+                    'depth': sum(
+                        1 for aa_item in config.parse_sequence(sequence)
+                        if aa_item not in ['_', 'x', 'X']
+                    )
                 }
                 prior = self.calculate_prior(context)
                 priors.append((aa, prior))
@@ -376,8 +403,13 @@ class ExpansionEngine:
             # 按先验排序（高先验 = 低能量 = 好）
             priors.sort(key=lambda x: x[1], reverse=True)
         else:
-            # 无EGNN时均匀分布（不应该发生）
-            priors = [(aa, 1.0/len(unexpanded)) for aa in unexpanded]
+            # 无EGNN时随机采样，避免顺序偏置（否则非天然氨基酸永远排最后）
+            import random as _random
+            n_take = min(max_expansions, len(unexpanded))
+            sampled = _random.sample(unexpanded, n_take)
+            priors = [(aa, 1.0/len(unexpanded)) for aa in sampled]
+            # 只扩展 n_take 个（后续切片不会出错）
+            max_expansions = n_take
         
         # 只扩展前max_expansions个（Top-k）
         to_expand = priors[:max_expansions]
@@ -394,86 +426,6 @@ class ExpansionEngine:
             new_children[aa] = child
         
         return new_children
-    
-    def expand_with_softmax_allocation(
-        self,
-        nodes: List['MCTSNode'],
-        total_slots: int = 50,
-        temperature: float = 1.0
-    ) -> Dict[str, int]:
-        """
-        使用Softmax概率分配扩展名额到多个节点
-        
-        流程:
-        1. 评估每个节点的平均能量（通过随机填充）
-        2. Softmax计算概率（取绝对值）
-        3. 按概率分配total_slots个名额
-        4. 每个节点根据分配到的名额扩展子节点
-        
-        Args:
-            nodes: 待扩展的节点列表
-            total_slots: 总扩展名额（默认50）
-            temperature: Softmax温度（默认1.0）
-        
-        Returns:
-            {node_key: 分配到的名额数}
-        """
-        import numpy as np
-        
-        if not nodes:
-            return {}
-        
-        # 步骤1: 评估每个节点的平均能量
-        node_energies = []
-        for node in nodes:
-            depth = sum(1 for c in node.state.sequence if c not in ['_', 'x', 'X'])
-            
-            # 获取随机填充数量
-            try:
-                from adaptive_mcts_config import AdaptiveMCTSConfig
-                n_fills = AdaptiveMCTSConfig.get_random_fill_count(depth)
-            except ImportError:
-                n_fills = max(10, 50 - depth * 7)
-            
-            # 随机填充并评估
-            energies = self._random_fill_and_evaluate(node.state.sequence, n_fills)
-            avg_energy = sum(energies) / len(energies) if energies else -5.0
-            node_energies.append((node.state.to_key(), avg_energy))
-        
-        # 步骤2: Softmax计算概率（取绝对值）
-        abs_energies = np.array([abs(energy) for _, energy in node_energies])
-        exp_energies = np.exp(abs_energies / temperature)
-        probabilities = exp_energies / np.sum(exp_energies)
-        
-        # 步骤3: 按概率分配名额
-        allocations = np.floor(probabilities * total_slots).astype(int)
-        
-        # 处理剩余名额
-        remaining = total_slots - np.sum(allocations)
-        if remaining > 0:
-            fractional_parts = probabilities * total_slots - allocations
-            sorted_indices = np.argsort(fractional_parts)[::-1]
-            for i in range(remaining):
-                allocations[sorted_indices[i % len(sorted_indices)]] += 1
-        
-        # 构建返回字典
-        result = {}
-        for i, (node_key, _) in enumerate(node_energies):
-            result[node_key] = int(allocations[i])
-        
-        # 记录日志
-        try:
-            from mcts_logger import log_debug
-            log_debug("expansion", "Softmax分配完成", {
-                "total_slots": total_slots,
-                "temperature": temperature,
-                "allocations": result,
-                "probabilities": probabilities.tolist()
-            })
-        except ImportError:
-            pass
-        
-        return result
     
     def expand_node_with_allocated_slots(
         self,
@@ -739,6 +691,100 @@ class ExpansionEngine:
             return len(bonds - expanded) > 0
         
         return False
+    
+    def get_unexpanded_actions(self, node: MCTSNode) -> List:
+        """
+        获取节点所有未扩展的动作
+        
+        Returns:
+            - Level 1: [氨基酸名称, ...]
+            - Level 2: [交联剂类型, ...]
+            - Level 3: [(cys_i, cys_j), ...]
+        """
+        if node.is_terminal:
+            return []
+        
+        level = node.state.decision_level
+        
+        if level == 1:
+            next_pos = self.get_next_variable_position(node.state.sequence)
+            if next_pos is None:
+                return []
+            allowed = self.get_allowed_amino_acids(next_pos)
+            expanded = set(node.children.keys())
+            return [aa for aa in allowed if aa not in expanded]
+        
+        elif level == 2:
+            options = node.state.get_possible_crosslinkers()
+            def get_key(x):
+                return str(x) if x else "None"
+            expanded = set(node.children.keys())
+            return [x for x in options if get_key(x) not in expanded]
+        
+        elif level == 3:
+            bonds = node.state.get_possible_disulfide_bonds()
+            expanded = set(node.children.keys())
+            return [b for b in bonds if f"{b[0]}-{b[1]}" not in expanded]
+        
+        return []
+    
+    def expand_single(self, node: MCTSNode, action, prior_prob: Optional[float] = None) -> MCTSNode:
+        """
+        在节点上扩展**单个**动作，返回新子节点
+        """
+        level = node.state.decision_level
+        
+        if level == 1:
+            return self.expand_level1_single(node, action, prior_prob)
+        elif level == 2:
+            return self.expand_level2_single(node, action, prior_prob)
+        elif level == 3:
+            return self.expand_level3_single(node, action, prior_prob)
+        else:
+            raise ValueError(f"无法扩展：节点决策层={level}, is_terminal={node.is_terminal}")
+    
+    def get_all_possible_actions(self, node: MCTSNode) -> List:
+        """
+        列出当前节点的所有可能动作（不管是否已扩展）
+        """
+        if node.is_terminal:
+            return []
+        
+        level = node.state.decision_level
+        
+        if level == 1:
+            next_pos = self.get_next_variable_position(node.state.sequence)
+            if next_pos is None:
+                return []
+            return list(self.get_allowed_amino_acids(next_pos))
+        
+        elif level == 2:
+            return list(node.state.get_possible_crosslinkers())
+        
+        elif level == 3:
+            return list(node.state.get_possible_disulfide_bonds())
+        
+        return []
+    
+    def action_to_key(self, action) -> str:
+        """把动作转成 node.children 的 key"""
+        if action is None:
+            return "None"
+        if isinstance(action, tuple):
+            return f"{action[0]}-{action[1]}"
+        return str(action)
+    
+    def is_fully_expanded(self, node: MCTSNode) -> bool:
+        """检查节点是否已经完全扩展（所有可能的动作都试过了）"""
+        return len(self.get_unexpanded_actions(node)) == 0
+    
+    def expand_batch(self, node: MCTSNode, max_expansions: int = 5) -> Dict[str, MCTSNode]:
+        """
+        批量扩展节点（一次加多个子节点）
+        
+        用于路径式 MCTS：每到一个节点，若未完全扩展，批量加一些子节点
+        """
+        return self.expand(node, max_expansions=max_expansions)
 
 
 def main():
@@ -753,18 +799,23 @@ def main():
     
     # 测试1：Level 1扩展（氨基酸）
     print("\n[测试1] Level 1: 氨基酸扩展")
-    root = create_root_node("AC_____C______CG")
+    root = create_root_node("AC___C___CG")
     print(f"  初始: {root.state}")
     
     children = engine.expand_level1_amino_acid(root)
     print(f"  扩展了 {len(children)} 个子节点")
     for action, child in list(children.items())[:5]:
-        print(f"    {action}: seq={child.state.sequence[:15]}, prior={child.prior_prob:.4f}")
-    
+        seq_display = config.format_sequence(
+            config.parse_sequence(child.state.sequence)[:15]
+        )
+        print(f"    {action}: seq={seq_display}, prior={child.prior_prob:.4f}")
+
     # 测试2：模拟序列完成，Level 2扩展（交联剂）
     print("\n[测试2] Level 2: 交联剂扩展")
     completed_state = root.state.copy()
-    completed_state.sequence = "ACARNDCMVFLWPCG"
+    # 用 config 的模板填充
+    from seq_generator import generate_full_sequence
+    completed_state.sequence = generate_full_sequence()
     completed_state._update_completion_status()
     
     node2 = MCTSNode(state=completed_state)
@@ -793,7 +844,7 @@ def main():
     
     # 测试4：逐步扩展（MCTS风格）
     print("\n[测试4] 逐步扩展（MCTS风格）")
-    root2 = create_root_node("AC_____C______CG")
+    root2 = create_root_node("AC___C___CG")
     print(f"  初始决策层: {root2.state.decision_level}")
     print(f"  初始子节点数: {len(root2.children)}")
     
@@ -832,7 +883,13 @@ def main():
             next_node = min(current.children.values(), key=lambda n: n.visit_count)
             path.append(next_node)
             current = next_node
-            print(f"  Step {step+1} (Level {level}): {current.decision_action} -> {current.state.sequence[:20] if level==1 else current.state.crosslinker}")
+            if level == 1:
+                seq_display = config.format_sequence(
+                    config.parse_sequence(current.state.sequence)[:20]
+                )
+            else:
+                seq_display = current.state.crosslinker
+            print(f"  Step {step + 1} (Level {level}): {current.decision_action} -> {seq_display}")
         else:
             break
     
