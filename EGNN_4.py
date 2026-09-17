@@ -341,9 +341,6 @@ def main(model_path: Optional[Path] = None,
     else:
         # fallback：使用原默认路径
         if model_path is None:
-            if target_name is not None:
-            model_path = config.get_egnn_dirs(target_name)["models"] / "best_model.pt"
-        else:
             model_path = config.BASE_DIR / "egnn" / "models" / "best_model.pt"
         if test_data_path is None:
             test_data_path = config.BASE_DIR / "egnn" / "raw" / "test_data.npz"
@@ -409,6 +406,7 @@ if __name__ == "__main__":
     parser.add_argument('--hidden-dim', type=int, default=128)
     parser.add_argument('--num-layers', type=int, default=4)
     
+    parser.add_argument('--target', type=str, default=None, help='靶点名称（如 6Y9A）')
     args = parser.parse_args()
     
     main(
@@ -416,7 +414,8 @@ if __name__ == "__main__":
         test_data_path=args.test_data,
         output_dir=args.output_dir,
         hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers
+        num_layers=args.num_layers,
+        target_name=args.target
     )
 
 def calculate_pocket_distances(sequences: List[str], target_name: Optional[str] = None) -> np.ndarray:
